@@ -166,6 +166,9 @@ module creation and usually don't contain much more than the module name.
 For someone who is allergic to databases, this will mark all items as "read" that
 look like they are database drivers for DBI.
 
+Note that this wouldn't exclude a module with a detected name of simply "DBD".
+For that you would have to use something like /^DBD(-|$)/
+
 See NAMES AND VERSIONS.
 
 =item whitelist:$author =~ /^Damian Conway$/

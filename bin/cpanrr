@@ -166,8 +166,18 @@ module creation and usually don't contain much more than the module name.
 For someone who is allergic to databases, this will mark all items as "read" that
 look like they are database drivers for DBI.
 
-Note that this wouldn't exclude a module with a detected name of simply "DBD".
-For that you would have to use something like /^DBD(-|$)/
+Note that this wouldn't mark an entry as read if it had a name of simply "DBD".
+
+See NAMES AND VERSIONS.
+
+=item read:$module =~ /^DBD(?:-|$)/
+
+As the previous example, but now also would mark "DBD" as read.
+
+Note that the grouping has to be non-capturing because with capturing
+parenthesis the list of matches will be returned by the regex. When the
+module name is "DBD" that returned value will contain an empty string,
+which is false in boolean context.
 
 See NAMES AND VERSIONS.
 

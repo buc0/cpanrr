@@ -1,0 +1,376 @@
+#!/usr/bin/perl
+
+# shamelessly cribbed from cpanm
+eval 'exec /usr/bin/perl -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+=head1 NAME
+
+cpanrr - CPAN Reader Reducer, a helper for Google Reader
+
+=head1 SYNOPSIS
+
+  $ cpanrr
+  password: 
+  marking 2 (of 17) entries as read
+  $ 
+
+After following http://search.cpan.org/uploads.rdf on Google Reader for some time
+I noticed that if a module was updated then it had a better-than-average chance of
+being updated again.
+
+This was especially evident when I allowed the feed to accumulate hundreds of unread
+items (e.g. while on vacation).  The idea for this script came out of a desire to
+automatically mark all but the most-recent version of each module as "read", thus
+reducing the amount of manual work needed to catch back up.
+
+Along the way, I also decided that there were some module families that I wasn't
+interested in, so I figured it would be nice to have those automatically marked
+as "read" too.
+
+Then, just for parity, I added a feature to allow things to be whitelisted so that
+they were never automatically marked as "read".
+
+=cut
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Getopt::Long;
+use IO::Prompt;
+use WebService::Google::Reader;
+
+my $cpan = 'feed/http://search.cpan.org/uploads.rdf';
+
+my $pretend = 0;
+my $username;
+my $password = "Jr%d<{%-";
+my $rcfile = "$ENV{HOME}/.cpanrrrc";
+my $verbose = 0;
+
+=head1 OPTIONS
+
+cpanrr recognizes the following options:
+
+=over 4
+
+=item -p, --pretend
+
+Gets information from Google Reader, but doesn't actually mark any items as read.
+Useful for testing new read: and whitelist: rules.  Most useful with --verbose.
+
+=item -v, --verbose
+
+Prints a line for each item in the reading list.  Each line includes the parsed
+version string and an indication of whether it would be read or left alone.
+
+=item -u, --username 'user@gmail.com'
+
+Specify the username on the command-line.  Overrides any user name present in the
+rcfile (if any).
+
+=item -r, --rcfile somefile
+
+Specify an alternate file to use as the rcfile.  Default is $ENV{HOME}/.cpanrrrc
+
+=back
+
+=cut
+
+GetOptions(
+    'pretend!'   => \$pretend,
+    'rcfile=s'   => \$rcfile,
+    'username=s' => \$username,
+    'verbose!'   => \$verbose,
+);
+
+my @read_filters;
+my @whitelist_filters;
+
+# for the filters
+my( $module, $version, $author, $entry, %seen );
+
+=head1 RCFILE
+
+With no rcfile, cpanrr will only mark items as "read" if there is a newer unread item
+with the same calculated module name (see NAMES AND VERSIONS), and the username must
+be specified on the command-line.
+
+Blank lines and lines where the first non-whitespace character is '#' are ignored.
+
+=over 4
+
+=item username:user@gmail.com
+
+Specifies the username to use when connecting to Google Reader.
+
+If specified multiple times only the first line is used.
+
+=item read:<filter text>
+
+=item whitelist:<filter text>
+
+Specifies a read filter or whitelist filter.  See FILTERS.
+
+=back
+
+=head1 FILTERS
+
+The <filter text> will be string eval()ed into the body of an anonymous subroutine
+and will have the following variables available to it:
+
+=over 4
+
+=item $module
+
+The module name, as detected by cpanrr.
+
+See NAMES AND VERSIONS.
+
+=item $version
+
+The version string, as detected by cpanrr.  This should absolutely not be expected
+to be numeric, as this is the version string from the upload which tends to have
+things like "0.01_02", "2.00b06", "1.300001-TRIAL", etc.
+
+See NAMES AND VERSIONS.
+
+=item $author
+
+The author, as identified by the CPAN uploads feed.  This appears to be their
+full name, as reported by CPAN, and thus may contain non-ASCII characters (has not
+been extensively tested).
+
+=item $entry
+
+The WebService::Google::Reader::ListElement for the item.
+
+=item %seen
+
+The hash of $module => $version used to de-duplicate the feed.
+
+=back
+
+=head1 FILTER EXAMPLES
+
+=over 4
+
+=item read:$version =~ /^0.0+1$/
+
+Marks all modules with version 0.01 and 0.001 as "read".  These tend to be initial
+module creation and usually don't contain much more than the module name.
+
+=item read:$module =~ /^DBD-/
+
+For someone who is allergic to databases, this will mark all items as "read" that
+look like they are database drivers for DBI.
+
+See NAMES AND VERSIONS.
+
+=item whitelist:$author =~ /^Damian Conway$/
+
+This will keep all items by "Damian Conway" unread, even multiple instances of the
+same module.
+
+=back
+
+=cut
+
+if( -f $rcfile && -r _ ) {
+    my %filters = ( read => \@read_filters, whitelist => \@whitelist_filters );
+
+    my $rcfh;
+
+    open $rcfh, '<', $rcfile;
+
+    if( $rcfh ) {
+        while( my $line = <$rcfh> ) {
+            chomp $line;
+
+            next if $line =~ /^\s*$/;
+            next if $line =~ /^\s*#/;
+
+            if( $line =~ /^(read|whitelist):(.*)/ ) {
+                my( $filter_type, $filter_text ) = ( $1, $2 );
+
+                my $sub = eval "sub { $filter_text }";
+
+                if( $sub ) {
+                    push @{ $filters{ $filter_type } }, $sub;
+                }
+            }
+            elsif( $line =~ /^username:(.*)/ ) {
+                unless( $username ) {
+                    $username = $1;
+                }
+            }
+        }
+    }
+}
+
+unless( $username ) {
+    die "username must be specified on the command-line or in the rcfile\n";
+}
+
+my $reader;
+my %feeds;
+
+=head1 PASSWORD HANDLING
+
+The password is always prompted for without echoing back any characters.  By design
+there is no way to specify the password in either the rcfile or on the command-line.
+
+The password itself, once read in, is stored in a short-lived lexical and is used only
+for calling WebService::Google::Reader->new().  It appears that the
+WebService::Google::Reader object stores the password indefinitely as well as passing
+it along to other subordinate objects (as well as sending it to Google, obviously).
+
+=cut
+
+{
+    print "password: ";
+    my $password = prompt -echo => '';
+    $reader = WebService::Google::Reader->new(
+        username => $username,
+        password => $password,
+        secure => 1,
+    );
+
+    if( $reader ) {
+        # it appears that we don't know about authentication failure
+        # until we try to do something
+        my @feeds = $reader->feeds;
+
+        # $reader->error seems useless...
+        if(
+            $reader->error or
+            $reader->response->code != 200
+        ) {
+            die "unable to log in and retrieve list of feeds\n";
+        }
+
+        foreach my $feed( @feeds ) {
+            my $id = $feed->id;
+
+            $feeds{$id} = {
+                id    => $feed->id,
+                title => $feed->title,
+            }
+        }
+    }
+}
+
+if( not exists $feeds{$cpan} ) {
+    warn Dumper( \%feeds );
+    die "user doesn't appear to be subscribed to '$cpan'\n";
+}
+
+my $feed = $reader->feed(
+    $cpan,
+    exclude => { state => 'read' },
+);
+
+my @to_read;
+
+my $n_entries = 0;
+
+while( $feed ) {
+    my @entries = $feed->entries;
+
+    # not a new lexical so the filters can see it
+    foreach $entry( @entries ) {
+        $n_entries++;
+
+        my $title = $entry->title;
+        $author = $entry->author->name;
+
+        $module = $title;
+        my $to_read;
+
+=head1 NAMES AND VERSIONS
+
+The module names are derived from the title of the uploads.rdf entry, which itself
+appears to be the basename of the uploaded file.  This means that the displayed name
+will match the base module of a distribution as often as the author uses the module
+name for their file name.
+
+The versions are also derived from the title of the uploads.rdf entry, which means
+that they also come from the basename of the uploaded file.
+
+In other words, any connection between the "module name" or "version" and the
+contents of the uploaded file are due only to the established conventions that most
+CPAN authors and modules adhere to.
+
+=cut
+
+        # version numbering on CPAN is a mess
+        # most of the time the most reliable method seems to be to
+        # treat everything after the last '-' as the version without
+        # being particular about how it's structured, but sometimes you
+        # have modules like 'Email-Sender-1.300000-TRIAL' and you need
+        # to include other sections as well
+        # at least we aren't actually doing anything but storing it for
+        # informational purposes...
+        if( $module =~ s/-((?:[0-9_.]+-)*[^-]+)$// ) {
+            $version = $1;
+        }
+        else {
+            $version = 0;
+        }
+
+        if( $seen{$module} ) {
+            $to_read = 1;
+        }
+        else {
+            $seen{$module} = $version;
+        }
+
+        # read filters
+        if( !$to_read and @read_filters ) {
+            $to_read = grep { $_ } map { $_->() } @read_filters;
+        }
+
+        # whitelist filters
+        if( $to_read and @whitelist_filters ) {
+            $to_read = !( grep { $_ } map { $_->() } @whitelist_filters );
+        }
+
+        if( $to_read ) {
+            print "reading $module $version\n" if $verbose;
+
+            push @to_read, $entry;
+        }
+        else {
+            print "leaving $module $version\n" if $verbose;
+        }
+    }
+
+    $feed = $reader->more( $feed );
+}
+
+if( $pretend ) {
+    print "would mark " . @to_read . " (of $n_entries) entries as read\n";
+}
+else {
+    print "marking " . @to_read . " (of $n_entries) entries as read\n";
+    $reader->mark_read_entry( @to_read );
+}
+
+=head1 SEE ALSO
+
+L<Data::Dumper>, L<Getopt::Long>, L<IO::Prompt>, L<WebService::Google::Reader>
+
+=head1 COPYRIGHT
+
+Copyright 2013 Brian Conry
+
+=head1 AUTHOR
+
+Brian Conry
+
+=head1 LICENSE
+
+Same as Perl.  See http://dev.perl.org/licenses/ for more details.
+
+=cut

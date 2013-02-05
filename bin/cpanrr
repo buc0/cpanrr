@@ -367,7 +367,12 @@ if( $pretend ) {
 }
 else {
     print "marking " . @to_read . " (of $n_entries) entries as read\n";
-    $reader->mark_read_entry( @to_read );
+    while( my @chunk = splice( @to_read, 0, 50 ) ) {
+        $reader->mark_read_entry( @chunk );
+        if( $reader->error ) {
+            die $reader->error;
+        }
+    }
 }
 
 =head1 SEE ALSO
